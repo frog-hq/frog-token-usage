@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: cargo test --workspace
+      - run: cargo build --locked --release --target "${{ matrix.target }}" -p frog-token-usage
+      - name: Package
+        run: |
+          set -euo pipefail
+          package="frog-token-usage-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.target }}/release/frog-token-usage" README.md NOTICE LICENSE LICENSE-MIT LICENSE-APACHE "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frog-token-usage-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and SPDX SBOM
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- ./*.tar.gz > SHA256SUMS
+          cargo metadata --manifest-path ../Cargo.toml --locked --format-version 1 > cargo-metadata.json
+          metadata_sha=$(sha256sum cargo-metadata.json | cut -d' ' -f1)
+          cat > frog-token-usage.spdx.json <<EOF
+          {"spdxVersion":"SPDX-2.3","dataLicense":"CC0-1.0","SPDXID":"SPDXRef-DOCUMENT","name":"frog-token-usage-${GITHUB_REF_NAME}","documentNamespace":"https://github.com/${GITHUB_REPOSITORY}/releases/${GITHUB_REF_NAME}/spdx-${GITHUB_SHA}","creationInfo":{"created":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","creators":["Tool: cargo-metadata"]},"packages":[{"name":"frog-token-usage","SPDXID":"SPDXRef-Package","versionInfo":"${GITHUB_REF_NAME}","downloadLocation":"NOASSERTION","filesAnalyzed":false,"checksums":[{"algorithm":"SHA256","checksumValue":"${metadata_sha}"}],"licenseConcluded":"Apache-2.0 OR MIT","licenseDeclared":"Apache-2.0 OR MIT","copyrightText":"Copyright 2026 Frog contributors"}]}
+          EOF
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --prerelease

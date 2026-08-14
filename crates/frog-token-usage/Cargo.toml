@@ -1,0 +1,17 @@
+[package]
+name = "frog-token-usage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "frog-token-usage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+frog-token-usage-core = { path = "../frog-token-usage-core", version = "=0.1.0-alpha.1" }
+serde_json.workspace = true
