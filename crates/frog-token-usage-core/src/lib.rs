@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -89,8 +89,45 @@ impl TokenUsage {
 pub struct UsageGroup {
     pub source: String,
     pub model: String,
+    pub measurement: MeasurementProvenance,
     pub usage: TokenUsage,
     pub total_tokens: u64,
+}
+
+/// Describes how aggregate values were obtained without implying billing truth.
+/// `estimated` is reserved for a future, separately labelled cost model and is
+/// always false for the local-log scanner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementProvenance {
+    pub reported: bool,
+    pub derived: bool,
+    pub estimated: bool,
+}
+
+impl MeasurementProvenance {
+    const fn reported() -> Self {
+        Self {
+            reported: true,
+            derived: false,
+            estimated: false,
+        }
+    }
+
+    const fn derived() -> Self {
+        Self {
+            reported: false,
+            derived: true,
+            estimated: false,
+        }
+    }
+
+    const fn merge(self, rhs: Self) -> Self {
+        Self {
+            reported: self.reported || rhs.reported,
+            derived: self.derived || rhs.derived,
+            estimated: self.estimated || rhs.estimated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +149,7 @@ pub struct UsageReport {
     pub scope: String,
     pub billing_authoritative: bool,
     pub calculation: String,
+    pub measurement: MeasurementProvenance,
     pub totals: TokenUsage,
     pub total_tokens: u64,
     pub by_source_and_model: Vec<UsageGroup>,
@@ -134,43 +172,56 @@ pub fn scan(config: &ScanConfig) -> Result<UsageReport, ScanError> {
     validate_limits(config)?;
     let mut summary = ScanSummary::default();
     let mut sessions: HashMap<(Source, String), ParsedFile> = HashMap::new();
-    let mut remaining = config.max_files;
-
-    scan_roots(
+    let mut candidates = Vec::new();
+    collect_candidates(
         Source::Codex,
         &config.codex_roots,
-        config,
-        &mut remaining,
         &mut summary,
-        &mut sessions,
-    )?;
-    scan_roots(
+        &mut candidates,
+    );
+    collect_candidates(
         Source::ClaudeCode,
         &config.claude_roots,
-        config,
-        &mut remaining,
         &mut summary,
-        &mut sessions,
-    )?;
+        &mut candidates,
+    );
+    candidates.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.path.cmp(&right.path))
+    });
 
-    let mut grouped: BTreeMap<(Source, String), TokenUsage> = BTreeMap::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if index >= config.max_files {
+            summary.skipped_over_limit_files = summary.skipped_over_limit_files.saturating_add(1);
+            continue;
+        }
+        scan_candidate(candidate, config, &mut summary, &mut sessions)?;
+    }
+
+    let mut grouped: BTreeMap<(Source, String), MeasuredUsage> = BTreeMap::new();
     for parsed in sessions.into_values() {
-        for (model, usage) in parsed.by_model {
+        for (model, measured) in parsed.by_model {
             let slot = grouped.entry((parsed.source, model)).or_default();
-            *slot = slot.saturating_add(usage);
+            *slot = slot.saturating_add(measured);
         }
     }
 
     let mut totals = TokenUsage::default();
+    let mut measurement = MeasurementProvenance::default();
     let by_source_and_model = grouped
         .into_iter()
-        .map(|((source, model), usage)| {
-            totals = totals.saturating_add(usage);
+        .map(|((source, model), measured)| {
+            totals = totals.saturating_add(measured.usage);
+            measurement = measurement.merge(measured.measurement);
             UsageGroup {
                 source: source.as_str().to_owned(),
                 model,
-                total_tokens: usage.total(),
-                usage,
+                measurement: measured.measurement,
+                total_tokens: measured.usage.total(),
+                usage: measured.usage,
             }
         })
         .collect();
@@ -180,6 +231,7 @@ pub fn scan(config: &ScanConfig) -> Result<UsageReport, ScanError> {
         scope: "local_session_logs".to_owned(),
         billing_authoritative: false,
         calculation: "reported_or_derived_from_reported_local_events".to_owned(),
+        measurement,
         total_tokens: totals.total(),
         totals,
         by_source_and_model,
@@ -226,18 +278,22 @@ struct ParsedFile {
     source: Source,
     session_id: String,
     modified: SystemTime,
-    by_model: BTreeMap<String, TokenUsage>,
+    by_model: BTreeMap<String, MeasuredUsage>,
 }
 
-fn scan_roots(
+#[derive(Debug)]
+struct FileCandidate {
+    source: Source,
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+fn collect_candidates(
     source: Source,
     roots: &[PathBuf],
-    config: &ScanConfig,
-    remaining: &mut usize,
     summary: &mut ScanSummary,
-    sessions: &mut HashMap<(Source, String), ParsedFile>,
-) -> Result<(), ScanError> {
-    let mut files = Vec::new();
+    candidates: &mut Vec<FileCandidate>,
+) {
     for root in roots {
         if !root.exists() {
             continue;
@@ -259,54 +315,79 @@ fn scan_roots(
             if entry.file_type().is_file()
                 && entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
             {
-                files.push(entry.into_path());
+                let path = entry.into_path();
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.file_type().is_symlink() {
+                    summary.skipped_symlinks = summary.skipped_symlinks.saturating_add(1);
+                    continue;
+                }
+                candidates.push(FileCandidate {
+                    source,
+                    path,
+                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                });
             }
         }
     }
-    files.sort();
+}
 
-    for path in files {
-        if *remaining == 0 {
-            summary.skipped_over_limit_files = summary.skipped_over_limit_files.saturating_add(1);
-            continue;
-        }
-        *remaining -= 1;
+fn scan_candidate(
+    candidate: FileCandidate,
+    config: &ScanConfig,
+    summary: &mut ScanSummary,
+    sessions: &mut HashMap<(Source, String), ParsedFile>,
+) -> Result<(), ScanError> {
+    let metadata = match fs::symlink_metadata(&candidate.path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(()),
+    };
+    if metadata.file_type().is_symlink() {
+        summary.skipped_symlinks = summary.skipped_symlinks.saturating_add(1);
+        return Ok(());
+    }
+    if metadata.len() > config.max_file_bytes {
+        summary.skipped_oversized_files = summary.skipped_oversized_files.saturating_add(1);
+        return Ok(());
+    }
 
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if metadata.file_type().is_symlink() {
-            summary.skipped_symlinks = summary.skipped_symlinks.saturating_add(1);
-            continue;
+    let parsed = parse_file(
+        candidate.source,
+        &candidate.path,
+        metadata.modified().unwrap_or(candidate.modified),
+        config,
+        summary,
+    )?;
+    summary.scanned_files = summary.scanned_files.saturating_add(1);
+    let key = (candidate.source, parsed.session_id.clone());
+    match sessions.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(parsed);
         }
-        if metadata.len() > config.max_file_bytes {
-            summary.skipped_oversized_files = summary.skipped_oversized_files.saturating_add(1);
-            continue;
-        }
-
-        let parsed = parse_file(
-            source,
-            &path,
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            config,
-            summary,
-        )?;
-        summary.scanned_files = summary.scanned_files.saturating_add(1);
-        let key = (source, parsed.session_id.clone());
-        match sessions.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            summary.duplicate_sessions = summary.duplicate_sessions.saturating_add(1);
+            if parsed.modified > entry.get().modified {
                 entry.insert(parsed);
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                summary.duplicate_sessions = summary.duplicate_sessions.saturating_add(1);
-                if parsed.modified > entry.get().modified {
-                    entry.insert(parsed);
-                }
             }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MeasuredUsage {
+    usage: TokenUsage,
+    measurement: MeasurementProvenance,
+}
+
+impl MeasuredUsage {
+    fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            usage: self.usage.saturating_add(rhs.usage),
+            measurement: self.measurement.merge(rhs.measurement),
+        }
+    }
 }
 
 fn parse_file(
@@ -316,7 +397,7 @@ fn parse_file(
     config: &ScanConfig,
     summary: &mut ScanSummary,
 ) -> Result<ParsedFile, ScanError> {
-    let file = File::open(path).map_err(|source_error| ScanError::Io {
+    let file = open_session_file(path).map_err(|source_error| ScanError::Io {
         kind: source.as_str(),
         source: source_error,
     })?;
@@ -351,6 +432,17 @@ fn parse_file(
     }
 
     Ok(parser.finish(modified))
+}
+
+fn open_session_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
 enum BoundedLine {
@@ -402,10 +494,10 @@ struct FileParser {
     source: Source,
     session_id: String,
     model: String,
-    by_model: BTreeMap<String, TokenUsage>,
+    by_model: BTreeMap<String, MeasuredUsage>,
     codex_counter: CodexCounter,
     codex_token_events: usize,
-    codex_completed: BTreeMap<String, TokenUsage>,
+    codex_completed: BTreeMap<String, MeasuredUsage>,
     seen_claude_events: HashSet<String>,
 }
 
@@ -456,8 +548,8 @@ impl FileParser {
             }
             let last = info.get("last_token_usage").and_then(RawUsage::from_value);
             let total = info.get("total_token_usage").and_then(RawUsage::from_value);
-            if let Some(usage) = self.codex_counter.observe(last, total) {
-                self.add_usage(usage.normalised_codex());
+            if let Some(observed) = self.codex_counter.observe(last, total) {
+                self.add_usage(observed.usage.normalised_codex(), observed.measurement);
                 self.codex_token_events = self.codex_token_events.saturating_add(1);
             }
             return;
@@ -471,7 +563,10 @@ impl FileParser {
             {
                 let model = self.model.clone();
                 let slot = self.codex_completed.entry(model).or_default();
-                *slot = slot.saturating_add(usage.normalised_codex());
+                *slot = slot.saturating_add(MeasuredUsage {
+                    usage: usage.normalised_codex(),
+                    measurement: MeasurementProvenance::reported(),
+                });
             }
         }
     }
@@ -499,12 +594,15 @@ impl FileParser {
             }
         }
         let slot = self.by_model.entry(model).or_default();
-        *slot = slot.saturating_add(raw.normalised_claude());
+        *slot = slot.saturating_add(MeasuredUsage {
+            usage: raw.normalised_claude(),
+            measurement: MeasurementProvenance::reported(),
+        });
     }
 
-    fn add_usage(&mut self, usage: TokenUsage) {
+    fn add_usage(&mut self, usage: TokenUsage, measurement: MeasurementProvenance) {
         let slot = self.by_model.entry(self.model.clone()).or_default();
-        *slot = slot.saturating_add(usage);
+        *slot = slot.saturating_add(MeasuredUsage { usage, measurement });
     }
 
     fn finish(mut self, modified: SystemTime) -> ParsedFile {
@@ -598,23 +696,33 @@ struct CodexCounter {
     previous_total: Option<RawUsage>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedUsage {
+    usage: RawUsage,
+    measurement: MeasurementProvenance,
+}
+
 impl CodexCounter {
-    fn observe(&mut self, last: Option<RawUsage>, total: Option<RawUsage>) -> Option<RawUsage> {
+    fn observe(
+        &mut self,
+        last: Option<RawUsage>,
+        total: Option<RawUsage>,
+    ) -> Option<ObservedUsage> {
         let accepted = match (self.previous_total, last, total) {
             (None, Some(last), Some(total)) => {
                 self.previous_total = Some(total);
-                Some(last)
+                Some((last, MeasurementProvenance::reported()))
             }
-            (None, Some(last), None) => Some(last),
+            (None, Some(last), None) => Some((last, MeasurementProvenance::reported())),
             (None, None, Some(total)) => {
                 self.previous_total = Some(total);
-                Some(total)
+                Some((total, MeasurementProvenance::reported()))
             }
             (None, None, None) => None,
             (Some(previous), last, Some(total)) => match total.componentwise_delta(previous) {
                 Some(delta) => {
                     self.previous_total = Some(total);
-                    (delta.total() > 0).then_some(delta)
+                    (delta.total() > 0).then_some((delta, MeasurementProvenance::derived()))
                 }
                 None if last
                     .is_some_and(|last| total.looks_like_stale_regression(previous, last)) =>
@@ -623,13 +731,15 @@ impl CodexCounter {
                 }
                 None => {
                     self.previous_total = Some(total);
-                    last
+                    last.map(|usage| (usage, MeasurementProvenance::reported()))
                 }
             },
-            (Some(_), Some(last), None) => Some(last),
+            (Some(_), Some(last), None) => Some((last, MeasurementProvenance::reported())),
             (Some(_), None, None) => None,
         };
-        accepted.filter(|usage| usage.total() > 0)
+        accepted
+            .filter(|(usage, _)| usage.total() > 0)
+            .map(|(usage, measurement)| ObservedUsage { usage, measurement })
     }
 }
 
@@ -714,8 +824,12 @@ mod tests {
             ..RawUsage::default()
         };
         let mut counter = CodexCounter::default();
-        assert_eq!(counter.observe(Some(a), Some(a)), Some(a));
-        assert_eq!(counter.observe(Some(last), Some(b)), Some(last));
+        let first = counter.observe(Some(a), Some(a)).unwrap();
+        assert_eq!(first.usage, a);
+        assert_eq!(first.measurement, MeasurementProvenance::reported());
+        let second = counter.observe(Some(last), Some(b)).unwrap();
+        assert_eq!(second.usage, last);
+        assert_eq!(second.measurement, MeasurementProvenance::derived());
         assert_eq!(counter.observe(Some(last), Some(b)), None);
     }
 }

@@ -13,5 +13,5 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-frog-token-usage-core = { path = "../frog-token-usage-core", version = "=0.1.0-alpha.1" }
+frog-token-usage-core = { path = "../frog-token-usage-core", version = "=0.1.0-alpha.2" }
 serde_json.workspace = true
