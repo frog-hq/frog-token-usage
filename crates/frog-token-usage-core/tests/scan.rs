@@ -1,5 +1,6 @@
-use frog_token_usage_core::{scan, ScanConfig, TokenUsage};
-use std::fs;
+use frog_token_usage_core::{scan, MeasurementProvenance, ScanConfig, TokenUsage};
+use std::fs::{self, File, FileTimes};
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
 fn config(codex: &std::path::Path, claude: &std::path::Path) -> ScanConfig {
@@ -55,6 +56,35 @@ fn scans_supported_logs_without_exposing_content() {
     assert!(!json.contains("private"));
     assert!(!json.contains("secret"));
     assert!(!report.billing_authoritative);
+    assert_eq!(
+        report.measurement,
+        MeasurementProvenance {
+            reported: true,
+            derived: true,
+            estimated: false,
+        }
+    );
+    let codex_group = report
+        .by_source_and_model
+        .iter()
+        .find(|group| group.source == "codex")
+        .unwrap();
+    assert!(codex_group.measurement.reported);
+    assert!(codex_group.measurement.derived);
+    assert!(!codex_group.measurement.estimated);
+    let claude_group = report
+        .by_source_and_model
+        .iter()
+        .find(|group| group.source == "claude_code")
+        .unwrap();
+    assert_eq!(
+        claude_group.measurement,
+        MeasurementProvenance {
+            reported: true,
+            derived: false,
+            estimated: false,
+        }
+    );
 }
 
 #[test]
@@ -136,4 +166,73 @@ fn handles_codex_counter_reset_without_counting_stale_regression() {
     })
     .unwrap();
     assert_eq!(report.total_tokens, 105);
+}
+
+#[test]
+fn file_cap_selects_newest_sessions_across_sources() {
+    let root = tempdir().unwrap();
+    let codex = root.path().join("codex");
+    let claude = root.path().join("claude");
+    fs::create_dir_all(&codex).unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    let old_path = codex.join("old.jsonl");
+    let new_path = claude.join("new.jsonl");
+    fs::write(
+        &old_path,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":7}}}}\n",
+    )
+    .unwrap();
+    fs::write(
+        &new_path,
+        "{\"type\":\"assistant\",\"message\":{\"model\":\"newest\",\"usage\":{\"input_tokens\":11}}}\n",
+    )
+    .unwrap();
+    set_modified(&old_path, 10);
+    set_modified(&new_path, 20);
+
+    let mut capped = config(&codex, &claude);
+    capped.max_files = 1;
+    let report = scan(&capped).unwrap();
+    assert_eq!(report.total_tokens, 11);
+    assert_eq!(report.scan.scanned_files, 1);
+    assert_eq!(report.scan.skipped_over_limit_files, 1);
+    assert_eq!(report.by_source_and_model[0].source, "claude_code");
+}
+
+#[test]
+fn equal_modification_times_use_stable_path_order() {
+    let root = tempdir().unwrap();
+    let codex = root.path().join("codex");
+    fs::create_dir_all(&codex).unwrap();
+    let first_path = codex.join("a.jsonl");
+    let second_path = codex.join("b.jsonl");
+    fs::write(
+        &first_path,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"model\":\"first\",\"info\":{\"last_token_usage\":{\"input_tokens\":3}}}}\n",
+    )
+    .unwrap();
+    fs::write(
+        &second_path,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"model\":\"second\",\"info\":{\"last_token_usage\":{\"input_tokens\":5}}}}\n",
+    )
+    .unwrap();
+    set_modified(&first_path, 30);
+    set_modified(&second_path, 30);
+
+    let mut capped = config(&codex, root.path());
+    capped.max_files = 1;
+    let report = scan(&capped).unwrap();
+    assert_eq!(report.total_tokens, 3);
+    assert_eq!(report.by_source_and_model[0].model, "first");
+}
+
+fn set_modified(path: &std::path::Path, seconds: u64) {
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(
+            FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+        )
+        .unwrap();
 }

@@ -16,10 +16,12 @@ cargo run -p frog-token-usage -- --format table
 cargo run -p frog-token-usage -- --format json
 ```
 
-The machine-readable contract is versioned with `schema_version: 1`. Aggregates
-contain source, model, token categories, scan counters, and an explicit
-`billing_authoritative: false` marker. Raw event content and file paths are
-never part of the contract.
+The machine-readable contract is versioned with `schema_version: 1`. Report and
+per-model aggregates contain explicit `reported`, `derived`, and `estimated`
+measurement flags, token categories, scan counters, and
+`billing_authoritative: false`. The local scanner never estimates usage, so
+`estimated` remains false. Raw event content and file paths are never part of
+the contract.
 
 Environment discovery follows the tools' normal local data locations:
 
@@ -30,7 +32,12 @@ Environment discovery follows the tools' normal local data locations:
 The scanner does not follow symlinks. File count, file size, and record size are
 bounded. An unterminated active JSONL tail is reported and ignored until it is
 complete. Duplicate Codex session IDs and Claude request/message pairs are not
-double-counted.
+double-counted. If a file-count cap is reached, the newest sessions across all
+enabled sources are selected first with a deterministic path tie-breaker.
+
+Release binaries cover Linux x86_64/arm64 as static musl executables and macOS
+x86_64/arm64. Each archive is checksummed and covered by GitHub build-provenance
+attestation.
 
 ## Trust and scope
 

@@ -106,6 +106,10 @@ fn print_table(report: &UsageReport) {
     println!("Total {}", grouped_number(report.total_tokens));
     print_breakdown(report.totals);
     println!(
+        "Measurement: reported={} · derived={} · estimated={}",
+        report.measurement.reported, report.measurement.derived, report.measurement.estimated
+    );
+    println!(
         "Scanned {} files; skipped {} symlinks, {} oversized files, {} partial tails.",
         report.scan.scanned_files,
         report.scan.skipped_symlinks,
