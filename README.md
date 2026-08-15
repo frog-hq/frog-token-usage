@@ -35,6 +35,10 @@ complete. Duplicate Codex session IDs and Claude request/message pairs are not
 double-counted. If a file-count cap is reached, the newest sessions across all
 enabled sources are selected first with a deterministic path tie-breaker.
 
+Release binaries cover Linux x86_64/arm64 as static musl executables and macOS
+x86_64/arm64. Each archive is checksummed and covered by GitHub build-provenance
+attestation.
+
 ## Trust and scope
 
 - No network dependency exists in the core or CLI.
